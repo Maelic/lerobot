@@ -19,57 +19,63 @@ python -m lerobot.record --config=examples/multi_dataset_recording_example.py
 
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
 from lerobot.record import MultiRecordConfig, MultiDatasetRecordConfig, DatasetRecordConfig
-from lerobot.robots.so100_follower import SO100FollowerConfig
-from lerobot.teleoperators.so100_leader import SO100LeaderConfig
-
+from lerobot.robots.so101_follower import SO101FollowerConfig
+from lerobot.teleoperators.so101_leader import SO101LeaderConfig
 
 def create_multi_record_config():
     """Create a configuration for multi-dataset recording."""
     
     # Define the robot configuration
-    robot_config = SO100FollowerConfig(
-        type="so100_follower",
-        port="/dev/ttyUSB0",  # Adjust to your robot's port
+    robot_config = SO101FollowerConfig(
+        port="/dev/ttyACM0",  # Adjust to your robot's port
         cameras={
-            "laptop": OpenCVCameraConfig(
-                type="opencv",
-                camera_index=0,
+            'up': OpenCVCameraConfig(
+                index_or_path=2,
                 width=640,
                 height=480,
-                fps=30,
+                fps=30
             ),
+            'side': OpenCVCameraConfig(
+                index_or_path=0,
+                width=640,
+                height=480,
+                fps=30
+            )
         },
-        id="follower_robot",
+        id="follower_arm",
     )
     
     # Define teleoperator configuration (optional)
-    teleop_config = SO100LeaderConfig(
-        type="so100_leader",
-        port="/dev/ttyUSB1",  # Adjust to your teleoperator's port
-        id="leader_robot",
+    teleop_config = SO101LeaderConfig(
+        port="/dev/ttyACM1",  # Adjust to your teleoperator's port
+        id="leader_arm",
     )
+
+    episodes = 2  # Number of episodes should be the same for both datasets
     
     # Define multiple dataset configurations for different stages
     dataset_configs = [
         DatasetRecordConfig(
-            repo_id="username/pick_motion_dataset",
-            single_task="Pick up the object from the table",
+            repo_id="maelic/pick_knife",
+            single_task="Pick up the knife from the table.",
             fps=30,
-            episode_time_s=30,  # 30 seconds for pick motion
+            episode_time_s=60,  # 30 seconds for pick motion
             reset_time_s=10,
-            num_episodes=50,
+            num_episodes=episodes,
             video=True,
             push_to_hub=False,  # Set to True if you want to upload
+            private=True,  # Set to True if you want to keep the dataset private
         ),
         DatasetRecordConfig(
-            repo_id="username/place_motion_dataset", 
-            single_task="Place the object in the target location",
+            repo_id="maelic/place_left_knife",
+            single_task="Place the knife to the left of the plate.",
             fps=30,
-            episode_time_s=30,  # 30 seconds for place motion
+            episode_time_s=60,  # 30 seconds for place motion
             reset_time_s=10,
-            num_episodes=50,
+            num_episodes=episodes,
             video=True,
             push_to_hub=False,  # Set to True if you want to upload
+            private=True,  # Set to True if you want to keep the dataset private
         ),
     ]
     
@@ -85,7 +91,7 @@ def create_multi_record_config():
         multi_dataset=multi_dataset_config,
         teleop=teleop_config,
         policy=None,  # No policy, using teleop
-        display_data=True,
+        display_data=False,
         play_sounds=True,
         resume=False,
     )

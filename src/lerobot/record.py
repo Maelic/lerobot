@@ -461,6 +461,7 @@ def multi_record_loop(
     events: dict,
     fps: int,
     datasets: list[LeRobotDataset],
+    dataset_configs: list[DatasetRecordConfig],  # Add dataset configs to access single_task
     teleop: Teleoperator | list[Teleoperator] | None = None,
     policy: PreTrainedPolicy | None = None,
     control_time_s: int | None = None,
@@ -497,9 +498,27 @@ def multi_record_loop(
     current_dataset = datasets[current_stage] if current_stage < len(datasets) else None
     
     print(f"Starting recording with stage {current_stage}")
-    print(f"Available stages: {[f'Stage {i}: {ds.meta.robot_type}' for i, ds in enumerate(datasets)]}")
-    
+    print(f"Available stages: {[f'Stage {i}: {ds.meta.repo_id}' for i, ds in enumerate(datasets)]}")
+    from tqdm import tqdm
+
+    pbar = tqdm(
+        total=control_time_s,
+        desc="Recording",
+        unit="s",
+        bar_format="{desc} {percentage:3.0f}%: {bar} | Elapsed: {elapsed} | Remaining: {remaining}", 
+    )
+    last_timestamp = 0
     while timestamp < control_time_s:
+
+        # Update progress bar with elapsed time since last update
+        if control_time_s is not None:
+            elapsed_since_last = timestamp - last_timestamp
+            # round to 2 decimal places for better readability
+            elapsed_since_last = round(elapsed_since_last, 2)
+
+            pbar.update(float(elapsed_since_last))
+            last_timestamp = timestamp
+
         start_loop_t = time.perf_counter()
 
         if events["exit_early"]:
@@ -513,7 +532,7 @@ def multi_record_loop(
             if new_stage < len(datasets):
                 current_stage = new_stage
                 current_dataset = datasets[current_stage]
-                print(f"Recording switched to stage {current_stage}")
+                print(f"Recording switched to stage {current_stage}: {current_dataset.meta.repo_id}")
 
         observation = robot.get_observation()
 
@@ -521,12 +540,14 @@ def multi_record_loop(
             observation_frame = build_dataset_frame(current_dataset.features, observation, prefix="observation")
 
         if policy is not None:
+            # Use the task from the dataset configuration
+            current_task = dataset_configs[current_stage].single_task if current_stage < len(dataset_configs) else None
             action_values = predict_action(
                 observation_frame,
                 policy,
                 get_safe_torch_device(policy.config.device),
                 policy.config.use_amp,
-                task=current_dataset.meta.tasks[0] if current_dataset and current_dataset.meta.tasks else None,
+                task=current_task,
                 robot_type=robot.robot_type,
             )
             action = {key: action_values[i].item() for i, key in enumerate(robot.action_features)}
@@ -556,7 +577,9 @@ def multi_record_loop(
         if current_dataset is not None:
             action_frame = build_dataset_frame(current_dataset.features, sent_action, prefix="action")
             frame = {**observation_frame, **action_frame}
-            current_dataset.add_frame(frame, task=current_dataset.meta.tasks[0] if current_dataset.meta.tasks else None)
+            # Use the task from the dataset configuration
+            current_task = dataset_configs[current_stage].single_task if current_stage < len(dataset_configs) else None
+            current_dataset.add_frame(frame, task=current_task)
 
         if display_data:
             log_rerun_data(observation, action)
@@ -565,6 +588,8 @@ def multi_record_loop(
         busy_wait(1 / fps - dt_s)
 
         timestamp = time.perf_counter() - start_episode_t
+
+    pbar.close()
 
 
 @parser.wrap()
@@ -613,6 +638,7 @@ def multi_record(cfg: MultiRecordConfig) -> list[LeRobotDataset]:
                 batch_encoding_size=dataset_cfg.video_encoding_batch_size,
             )
         datasets.append(dataset)
+        print(f"Created dataset {i}: {dataset_cfg.repo_id} (current episodes: {dataset.num_episodes})")
 
     # Load pretrained policy
     policy = None if cfg.policy is None else make_policy(cfg.policy, ds_meta=datasets[0].meta)
@@ -623,6 +649,9 @@ def multi_record(cfg: MultiRecordConfig) -> list[LeRobotDataset]:
 
     # Use custom keyboard listener for stage switching
     listener, events = init_multi_keyboard_listener(cfg.multi_dataset.stage_switch_keys)
+    
+    # Reset to stage 0 at the beginning
+    events["current_stage"] = 0
 
     # Print instructions for the user
     print("\n=== Multi-Dataset Recording Instructions ===")
@@ -638,7 +667,12 @@ def multi_record(cfg: MultiRecordConfig) -> list[LeRobotDataset]:
         max_episodes = max(dataset_cfg.num_episodes for dataset_cfg in cfg.multi_dataset.datasets)
         
         while recorded_episodes < max_episodes and not events["stop_recording"]:
+            # Reset to stage 0 at the beginning of each episode
+            events["current_stage"] = 0
+            
             log_say(f"Recording multi-stage episode {recorded_episodes + 1}", cfg.play_sounds)
+            print(f"Starting episode {recorded_episodes + 1} - Currently at stage 0: {cfg.multi_dataset.datasets[0].repo_id}")
+            print("Use the configured keys to switch between recording stages during the episode.")
             
             # Record the multi-stage episode
             multi_record_loop(
@@ -646,9 +680,10 @@ def multi_record(cfg: MultiRecordConfig) -> list[LeRobotDataset]:
                 events=events,
                 fps=cfg.multi_dataset.datasets[0].fps,  # Use first dataset's fps
                 datasets=datasets,
+                dataset_configs=cfg.multi_dataset.datasets,  # Pass dataset configs
                 teleop=teleop,
                 policy=policy,
-                control_time_s=cfg.multi_dataset.datasets[0].episode_time_s,  # Use first dataset's time
+                control_time_s=sum(dataset_cfg.episode_time_s for dataset_cfg in cfg.multi_dataset.datasets),  # Use first dataset's time
                 display_data=cfg.display_data,
             )
 
@@ -678,10 +713,28 @@ def multi_record(cfg: MultiRecordConfig) -> list[LeRobotDataset]:
                     dataset.clear_episode_buffer()
                 continue
 
-            # Save episodes for all datasets
-            for dataset in datasets:
-                dataset.save_episode()
-            recorded_episodes += 1
+            # Save episodes only for datasets that have frames recorded
+            saved_any_dataset = False
+            for i, dataset in enumerate(datasets):
+                if len(dataset.episode_buffer) > 0:  # Only save if there are frames
+                    try:
+                        dataset.save_episode()
+                        saved_any_dataset = True
+                        print(f"Saved episode for dataset {i}: {cfg.multi_dataset.datasets[i].repo_id}")
+                    except Exception as e:
+                        print(f"Error saving episode for dataset {i}: {e}")
+                        # Clear the buffer to avoid issues
+                        dataset.clear_episode_buffer()
+                else:
+                    # Clear empty buffer to avoid issues
+                    dataset.clear_episode_buffer()
+                    print(f"No data recorded for dataset {i}: {cfg.multi_dataset.datasets[i].repo_id}")
+            
+            if saved_any_dataset:
+                recorded_episodes += 1
+                print(f"Episode {recorded_episodes} completed successfully")
+            else:
+                print("Warning: No data recorded for any dataset in this episode. Episode not counted.")
 
     log_say("Stop recording", cfg.play_sounds, blocking=True)
 
